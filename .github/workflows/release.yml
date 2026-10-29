@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 暂不发布到 crates.io：等 wist-pki 稳定后再加一段 publish（与 wist-auth 同形）。
