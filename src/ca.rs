@@ -21,6 +21,15 @@ use crate::identity::gateway_uri;
 /// `notBefore` 回拨（容忍两端时钟偏差）。与 center/gwlinkd 一致。
 pub const CLIENT_CERT_NOT_BEFORE_SKEW_SECONDS: i64 = 300;
 
+/// 叶证书 TTL 上限（10 年）：防止 `now + ttl` 溢出，也避免签发"事实永久"的证书。
+pub const MAX_TTL_SECONDS: i64 = 10 * 365 * 24 * 60 * 60;
+
+/// 身份字符串长度上限（与 URI SAN 的实用长度对齐）。
+pub const MAX_IDENTITY_LEN: usize = 256;
+
+/// DNS SAN 长度上限（RFC 1035）。
+pub const MAX_DNS_NAME_LEN: usize = 253;
+
 /// 签出的证书。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedCertificate {
@@ -57,11 +66,25 @@ impl fmt::Debug for CertificateAuthority {
 }
 
 impl CertificateAuthority {
+    /// 从证书/私钥 PEM 载入。
+    ///
+    /// **会校验两者是否配对**：rcgen 的签发只用到私钥，证书仅作为 issuer 句柄；
+    /// 一旦错配，签出来的叶证书链永远验不过（客户端表现为 unknown issuer），
+    /// 所以在载入时就失败，而不是等到握手期。
     pub fn from_pem(ca_certificate_pem: &str, ca_key_pem: &str) -> Result<Self, String> {
         let params = CertificateParams::from_ca_cert_pem(ca_certificate_pem)
             .map_err(|err| format!("failed to parse CA certificate: {err}"))?;
         let issuer_key = KeyPair::from_pem(ca_key_pem)
             .map_err(|err| format!("failed to parse CA private key: {err}"))?;
+
+        let der = crate::inspect::first_certificate_der(ca_certificate_pem)
+            .map_err(|err| format!("failed to parse CA certificate: {err}"))?;
+        let (_, parsed) = X509Certificate::from_der(&der)
+            .map_err(|err| format!("failed to parse CA certificate: {err}"))?;
+        if parsed.public_key().raw != issuer_key.public_key_der().as_slice() {
+            return Err("CA 私钥与证书公钥不匹配：继续签发会产出无法验链的证书".to_string());
+        }
+
         let issuer = params
             .self_signed(&issuer_key)
             .map_err(|err| format!("failed to load CA as an issuer: {err}"))?;
@@ -90,6 +113,9 @@ impl CertificateAuthority {
 
     /// 生成一把新的自签 CA；返回 `(实例, 证书 PEM, 私钥 PEM)`。
     pub fn generate(common_name: &str) -> Result<(Self, String, String), String> {
+        if common_name.trim().is_empty() {
+            return Err("CA common name must not be empty".to_string());
+        }
         let mut params = CertificateParams::default();
         params
             .distinguished_name
@@ -118,9 +144,7 @@ impl CertificateAuthority {
         identity: &str,
         ttl_seconds: i64,
     ) -> Result<IssuedCertificate, String> {
-        if identity.is_empty() {
-            return Err("client identity must not be empty".to_string());
-        }
+        validate_identity(identity)?;
         let uri = gateway_uri(identity);
         let san = SanType::URI(
             uri.clone()
@@ -142,6 +166,8 @@ impl CertificateAuthority {
     }
 
     /// 用 CSR 的公钥签一张服务端证书（`EKU=serverAuth`，DNS SAN）。
+    ///
+    /// 第一个 DNS 名会同时用作 CN（人类可读标签）；通配符 `*.example.com` 允许。
     pub fn issue_server_certificate(
         &self,
         csr_pem: &str,
@@ -153,6 +179,7 @@ impl CertificateAuthority {
         };
         let mut sans = Vec::with_capacity(dns_names.len());
         for name in dns_names {
+            validate_dns_name(name)?;
             sans.push(SanType::DnsName(
                 name.clone()
                     .try_into()
@@ -182,11 +209,7 @@ impl CertificateAuthority {
         extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
         ttl_seconds: i64,
     ) -> Result<IssuedCertificate, String> {
-        if ttl_seconds <= 0 {
-            return Err(format!(
-                "certificate ttl must be positive, got {ttl_seconds}"
-            ));
-        }
+        validate_ttl(ttl_seconds)?;
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|err| format!("failed to parse certificate signing request: {err}"))?;
 
@@ -258,6 +281,52 @@ pub fn load_or_create(
     }
 }
 
+fn validate_identity(identity: &str) -> Result<(), String> {
+    if identity.is_empty() {
+        return Err("client identity must not be empty".to_string());
+    }
+    if identity.len() > MAX_IDENTITY_LEN {
+        return Err(format!(
+            "client identity 过长（{} > {MAX_IDENTITY_LEN} 字节）",
+            identity.len()
+        ));
+    }
+    if identity
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '%'))
+    {
+        return Err(format!(
+            "client identity 含非法字符（不允许空白、控制字符或 / \\ ? # %）：{identity:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dns_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("DNS SAN must not be empty".to_string());
+    }
+    if name.len() > MAX_DNS_NAME_LEN {
+        return Err(format!(
+            "DNS SAN 过长（{} > {MAX_DNS_NAME_LEN} 字节）：{name}",
+            name.len()
+        ));
+    }
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!("DNS SAN 含空白或控制字符：{name:?}"));
+    }
+    Ok(())
+}
+
+fn validate_ttl(ttl_seconds: i64) -> Result<(), String> {
+    if ttl_seconds <= 0 || ttl_seconds > MAX_TTL_SECONDS {
+        return Err(format!(
+            "certificate ttl must be in 1..={MAX_TTL_SECONDS} seconds, got {ttl_seconds}"
+        ));
+    }
+    Ok(())
+}
+
 fn random_serial_bytes() -> Result<[u8; 16], String> {
     let mut serial = [0u8; 16];
     SystemRandom::new()
@@ -286,6 +355,7 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::identity::PeerIdentity;
+    use x509_parser::prelude::GeneralName;
 
     fn csr(common_name: &str) -> String {
         let key = KeyPair::generate().expect("key");
@@ -300,9 +370,43 @@ mod tests {
             .expect("csr pem")
     }
 
+    fn ca() -> (CertificateAuthority, String, String) {
+        CertificateAuthority::generate("Test CA").expect("ca")
+    }
+
+    fn san_uris(issued: &IssuedCertificate) -> Vec<String> {
+        let (_, cert) = X509Certificate::from_der(&issued.certificate_der).expect("parse");
+        let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+            return Vec::new();
+        };
+        san.value
+            .general_names
+            .iter()
+            .filter_map(|n| match n {
+                GeneralName::URI(uri) => Some(uri.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn san_dns(issued: &IssuedCertificate) -> Vec<String> {
+        let (_, cert) = X509Certificate::from_der(&issued.certificate_der).expect("parse");
+        let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+            return Vec::new();
+        };
+        san.value
+            .general_names
+            .iter()
+            .filter_map(|n| match n {
+                GeneralName::DNSName(dns) => Some(dns.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn issues_a_client_certificate_that_parses_back_to_its_identity() {
-        let (ca, _pem, _key) = CertificateAuthority::generate("Test CA").expect("ca");
+        let (ca, _pem, _key) = ca();
         let issued = ca
             .issue_client_certificate(&csr("ignored-cn"), "ingest-a", 3600)
             .expect("issue");
@@ -311,22 +415,188 @@ mod tests {
             PeerIdentity::from_certificate_der(&issued.certificate_der).expect("identity");
         assert_eq!(identity.id, "ingest-a");
         assert_eq!(identity.fingerprint_sha256, issued.fingerprint_sha256_hex);
+        assert_eq!(san_uris(&issued), vec!["wist://gateway/ingest-a"]);
+    }
+
+    #[test]
+    fn csr_subject_is_ignored() {
+        let (ca, _pem, _key) = ca();
+        let issued = ca
+            .issue_client_certificate(&csr("attacker-supplied"), "real-id", 600)
+            .expect("issue");
+        let (_, cert) = X509Certificate::from_der(&issued.certificate_der).expect("parse");
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cn, "real-id");
+        assert_eq!(issued.subject_cn, "real-id");
+    }
+
+    #[test]
+    fn issued_certificates_are_not_ca_and_have_a_valid_serial() {
+        let (ca, _pem, _key) = ca();
+        let issued = ca
+            .issue_client_certificate(&csr("x"), "id", 60)
+            .expect("issue");
+        let (_, cert) = X509Certificate::from_der(&issued.certificate_der).expect("parse");
+        assert!(!cert.is_ca());
+        assert_eq!(issued.serial_hex.len() % 2, 0);
+        assert!(issued.serial_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(issued.fingerprint_sha256_hex.len(), 64);
+    }
+
+    #[test]
+    fn not_before_is_skewed_back() {
+        let (ca, _pem, _key) = ca();
+        let issued = ca
+            .issue_client_certificate(&csr("x"), "id", 60)
+            .expect("issue");
+        let (_, cert) = X509Certificate::from_der(&issued.certificate_der).expect("parse");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(
+            cert.validity().not_before.timestamp() <= now - 250,
+            "expected ~300s skew"
+        );
     }
 
     #[test]
     fn issues_a_server_certificate_with_dns_san() {
-        let (ca, _pem, _key) = CertificateAuthority::generate("Test CA").expect("ca");
+        let (ca, _pem, _key) = ca();
         let issued = ca
-            .issue_server_certificate(&csr("ingest-ctrl"), &["ingest-ctrl".to_string()], 3600)
+            .issue_server_certificate(
+                &csr("ingest-ctrl"),
+                &["ingest-ctrl".to_string(), "alt.example.com".to_string()],
+                3600,
+            )
             .expect("issue");
 
+        assert_eq!(san_dns(&issued), vec!["ingest-ctrl", "alt.example.com"]);
+        assert!(san_uris(&issued).is_empty());
         let info = crate::inspect::inspect_pem(&issued.certificate_pem).expect("inspect");
         assert!(!info.is_ca);
         assert!(info.not_after.contains('T'));
     }
 
     #[test]
-    fn refuses_a_partial_ca_on_disk() {
+    fn server_certificate_requires_at_least_one_dns_name() {
+        let (ca, _pem, _key) = ca();
+        assert!(ca.issue_server_certificate(&csr("x"), &[], 60).is_err());
+    }
+
+    #[test]
+    fn server_certificate_rejects_bad_dns_names() {
+        let (ca, _pem, _key) = ca();
+        for bad in ["", " ", "has space", "ctrl\u{0}char"] {
+            assert!(
+                ca.issue_server_certificate(&csr("x"), &[bad.to_string()], 60)
+                    .is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        let too_long = "a".repeat(MAX_DNS_NAME_LEN + 1);
+        assert!(
+            ca.issue_server_certificate(&csr("x"), &[too_long], 60)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wildcard_dns_san_is_allowed() {
+        let (ca, _pem, _key) = ca();
+        let issued = ca
+            .issue_server_certificate(&csr("x"), &["*.example.com".to_string()], 60)
+            .expect("issue");
+        assert_eq!(san_dns(&issued), vec!["*.example.com"]);
+    }
+
+    #[test]
+    fn client_identity_is_validated() {
+        let (ca, _pem, _key) = ca();
+        for bad in ["", "a/b", "a b", "a\tb", "a?b", "a#b", "a%b", "a\\b"] {
+            assert!(
+                ca.issue_client_certificate(&csr("x"), bad, 60).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        let too_long = "a".repeat(MAX_IDENTITY_LEN + 1);
+        assert!(
+            ca.issue_client_certificate(&csr("x"), &too_long, 60)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ttl_must_be_positive_and_bounded() {
+        let (ca, _pem, _key) = ca();
+        for ttl in [0, -1, i64::MAX, MAX_TTL_SECONDS + 1] {
+            assert!(
+                ca.issue_client_certificate(&csr("x"), "id", ttl).is_err(),
+                "accepted ttl={ttl}"
+            );
+        }
+        assert!(
+            ca.issue_client_certificate(&csr("x"), "id", MAX_TTL_SECONDS)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn refuses_a_mismatched_key_pair() {
+        let (_ca_a, cert_a, _key_a) = ca();
+        let (_ca_b, _cert_b, key_b) = ca();
+        let err = CertificateAuthority::from_pem(&cert_a, &key_b).unwrap_err();
+        assert!(err.contains("不匹配"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_the_matching_pair() {
+        let (_ca, cert, key) = ca();
+        assert!(CertificateAuthority::from_pem(&cert, &key).is_ok());
+    }
+
+    #[test]
+    fn generate_rejects_an_empty_common_name() {
+        assert!(CertificateAuthority::generate("").is_err());
+        assert!(CertificateAuthority::generate("   ").is_err());
+    }
+
+    #[test]
+    fn generated_cas_differ() {
+        let (_, cert_a, key_a) = ca();
+        let (_, cert_b, key_b) = ca();
+        assert_ne!(cert_a, cert_b);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn validate_csr_accepts_and_rejects() {
+        assert!(validate_csr(&csr("x")).is_ok());
+        assert!(validate_csr("not a csr").is_err());
+    }
+
+    #[test]
+    fn load_or_create_generates_then_reuses() {
+        let dir = std::env::temp_dir().join(format!("wist-pki-loc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cert = dir.join("sub/ca.pem");
+        let key = dir.join("sub/ca.key");
+
+        let first = load_or_create(&cert, &key, "Test CA").expect("create");
+        let first_pem = first.ca_certificate_pem().to_string();
+        assert!(cert.exists() && key.exists());
+
+        let second = load_or_create(&cert, &key, "Test CA").expect("reload");
+        assert_eq!(second.ca_certificate_pem(), first_pem);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_create_refuses_a_partial_ca_on_disk() {
         let dir = std::env::temp_dir().join(format!("wist-pki-partial-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let cert = dir.join("ca.pem");

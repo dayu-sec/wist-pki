@@ -27,7 +27,7 @@ pub struct PeerIdentity {
     pub id: String,
     /// 命中的 URI SAN（若来自 URI）。
     pub uri: Option<String>,
-    /// 证书 CN（人类可读标签）。
+    /// 证书 CN（人类可读标签；已裁剪两端空白，空白 CN 视为缺失）。
     pub cn: Option<String>,
     /// 证书 DER 的 SHA-256（小写 hex）。
     pub fingerprint_sha256: String,
@@ -44,13 +44,17 @@ impl PeerIdentity {
         let (_, certificate) = X509Certificate::from_der(certificate_der)
             .map_err(|err| format!("failed to parse client certificate: {err}"))?;
 
+        // CN 仅作人类可读标签：裁剪空白；全空白的 CN 视为缺失（否则会得到一个 "" 身份）。
         let cn = certificate
             .subject()
             .iter_common_name()
             .next()
             .and_then(|attr| attr.as_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string);
 
+        // 只认 `wist://gateway/<id>` 这一种 URI SAN；其他 URI（spiffe:// 等）忽略。
         let mut uri = None;
         if let Ok(Some(san)) = certificate.subject_alternative_name() {
             for name in &san.value.general_names {
@@ -93,6 +97,25 @@ fn rfc3339(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+
+    fn cert(cn: Option<&str>, uris: &[&str]) -> Vec<u8> {
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::default();
+        // rcgen 默认会塞一个 CN（"rcgen self signed cert"）：这里显式清空，
+        // 才能构造“没有 CN”的证书。
+        params.distinguished_name = DistinguishedName::new();
+        if let Some(value) = cn {
+            params
+                .distinguished_name
+                .push(DnType::CommonName, value.to_string());
+        }
+        params.subject_alt_names = uris
+            .iter()
+            .map(|uri| SanType::URI(uri.to_string().try_into().expect("ia5")))
+            .collect();
+        params.self_signed(&key).expect("cert").der().to_vec()
+    }
 
     #[test]
     fn uri_round_trip() {
@@ -102,5 +125,99 @@ mod tests {
         );
         assert_eq!(gateway_id_from_uri("wist://gateway/"), None);
         assert_eq!(gateway_id_from_uri("https://example.com"), None);
+        assert_eq!(gateway_id_from_uri(""), None);
+    }
+
+    #[test]
+    fn uri_identity_wins_over_cn() {
+        let id =
+            PeerIdentity::from_certificate_der(&cert(Some("cn-label"), &["wist://gateway/uri-id"]))
+                .expect("identity");
+        assert_eq!(id.id, "uri-id");
+        assert_eq!(id.uri.as_deref(), Some("wist://gateway/uri-id"));
+        assert_eq!(id.cn.as_deref(), Some("cn-label"));
+    }
+
+    #[test]
+    fn non_gateway_uri_falls_back_to_cn() {
+        let id = PeerIdentity::from_certificate_der(&cert(
+            Some("cn-label"),
+            &["spiffe://example.org/workload"],
+        ))
+        .expect("identity");
+        assert_eq!(id.id, "cn-label");
+        assert_eq!(id.uri, None);
+    }
+
+    #[test]
+    fn empty_gateway_id_falls_back_to_cn() {
+        let id = PeerIdentity::from_certificate_der(&cert(Some("cn-label"), &["wist://gateway/"]))
+            .expect("identity");
+        assert_eq!(id.id, "cn-label");
+        assert_eq!(id.uri, None);
+    }
+
+    #[test]
+    fn picks_the_first_gateway_uri() {
+        let id = PeerIdentity::from_certificate_der(&cert(
+            None,
+            &["wist://gateway/first", "wist://gateway/second"],
+        ))
+        .expect("identity");
+        assert_eq!(id.id, "first");
+    }
+
+    #[test]
+    fn missing_uri_and_cn_is_an_error() {
+        let err = PeerIdentity::from_certificate_der(&cert(None, &[])).unwrap_err();
+        assert!(err.contains("neither"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blank_cn_is_treated_as_missing() {
+        let id = PeerIdentity::from_certificate_der(&cert(Some("   "), &["wist://gateway/uri-id"]))
+            .expect("identity");
+        assert_eq!(id.id, "uri-id");
+        assert_eq!(id.cn, None);
+
+        // 只有空白 CN、没有可用 URI → 仍然报错，而不是返回空身份。
+        assert!(PeerIdentity::from_certificate_der(&cert(Some("   "), &[])).is_err());
+    }
+
+    #[test]
+    fn cn_is_trimmed() {
+        let id =
+            PeerIdentity::from_certificate_der(&cert(Some("  padded  "), &[])).expect("identity");
+        assert_eq!(id.id, "padded");
+        assert_eq!(id.cn.as_deref(), Some("padded"));
+    }
+
+    #[test]
+    fn slash_in_uri_identity_is_preserved_by_the_parser() {
+        // 签发侧（ca.rs）会拒绝这种 identity；解析侧保持"如实反映证书内容"，
+        // 便于排障时看出对端到底出示了什么。
+        let id = PeerIdentity::from_certificate_der(&cert(None, &["wist://gateway/a/b"]))
+            .expect("identity");
+        assert_eq!(id.id, "a/b");
+    }
+
+    #[test]
+    fn reports_fingerprint_serial_and_validity() {
+        let der = cert(Some("id"), &[]);
+        let id = PeerIdentity::from_certificate_der(&der).expect("identity");
+        assert_eq!(
+            id.fingerprint_sha256,
+            crate::ca::hex_lower(digest(&SHA256, &der).as_ref())
+        );
+        assert!(!id.serial_hex.is_empty());
+        assert!(id.not_before.contains('T'));
+        assert!(id.not_after.contains('T'));
+        assert!(id.not_after > id.not_before);
+    }
+
+    #[test]
+    fn invalid_der_is_an_error() {
+        assert!(PeerIdentity::from_certificate_der(b"not a certificate").is_err());
+        assert!(PeerIdentity::from_certificate_der(&[]).is_err());
     }
 }
