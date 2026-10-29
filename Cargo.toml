@@ -1,0 +1,21 @@
+[package]
+name = "wist-pki"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Reusable CA / mTLS / peer-identity primitives extracted from wist-center + wist-gwlinkd"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+pem = "3"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["std"] }
+x509-parser = "0.16"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-rustls = "0.26"
