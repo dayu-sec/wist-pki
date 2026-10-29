@@ -11,14 +11,16 @@ pub fn write_pem(path: &Path, content: &str, mode: u32) -> Result<(), String> {
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, content).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    std::fs::write(&tmp, content)
+        .map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
             .map_err(|err| format!("failed to chmod {}: {err}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).map_err(|err| format!("failed to persist {}: {err}", path.display()))
+    std::fs::rename(&tmp, path)
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))
 }
 
 pub fn read_pem(path: &Path) -> Result<String, String> {

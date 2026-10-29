@@ -67,7 +67,9 @@ impl PeerIdentity {
             .as_deref()
             .and_then(gateway_id_from_uri)
             .or_else(|| cn.clone())
-            .ok_or_else(|| "client certificate has neither a gateway URI SAN nor a CN".to_string())?;
+            .ok_or_else(|| {
+                "client certificate has neither a gateway URI SAN nor a CN".to_string()
+            })?;
 
         let validity = certificate.validity();
         Ok(Self {
@@ -94,7 +96,10 @@ mod tests {
 
     #[test]
     fn uri_round_trip() {
-        assert_eq!(gateway_id_from_uri(&gateway_uri("gw-1")).as_deref(), Some("gw-1"));
+        assert_eq!(
+            gateway_id_from_uri(&gateway_uri("gw-1")).as_deref(),
+            Some("gw-1")
+        );
         assert_eq!(gateway_id_from_uri("wist://gateway/"), None);
         assert_eq!(gateway_id_from_uri("https://example.com"), None);
     }

@@ -26,8 +26,8 @@ pub fn inspect_pem_file(path: &Path) -> Result<CertInfo, String> {
 
 pub fn inspect_pem(pem_text: &str) -> Result<CertInfo, String> {
     let der = first_certificate_der(pem_text)?;
-    let (_, certificate) =
-        X509Certificate::from_der(&der).map_err(|err| format!("failed to parse certificate: {err}"))?;
+    let (_, certificate) = X509Certificate::from_der(&der)
+        .map_err(|err| format!("failed to parse certificate: {err}"))?;
     let validity = certificate.validity();
     Ok(CertInfo {
         subject: certificate.subject().to_string(),
@@ -35,9 +35,7 @@ pub fn inspect_pem(pem_text: &str) -> Result<CertInfo, String> {
         not_before: rfc3339(validity.not_before.timestamp()),
         not_after: rfc3339(validity.not_after.timestamp()),
         serial_hex: crate::ca::hex_lower(certificate.raw_serial()),
-        sha256: crate::ca::hex_lower(
-            ring::digest::digest(&ring::digest::SHA256, &der).as_ref(),
-        ),
+        sha256: crate::ca::hex_lower(ring::digest::digest(&ring::digest::SHA256, &der).as_ref()),
         is_ca: certificate.is_ca(),
     })
 }

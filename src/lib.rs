@@ -16,6 +16,6 @@ pub mod identity;
 pub mod inspect;
 pub mod tls;
 
-pub use ca::{CertificateAuthority, IssuedCertificate, CLIENT_CERT_NOT_BEFORE_SKEW_SECONDS};
+pub use ca::{CLIENT_CERT_NOT_BEFORE_SKEW_SECONDS, CertificateAuthority, IssuedCertificate};
 pub use identity::{GATEWAY_URI_PREFIX, PeerIdentity, gateway_id_from_uri, gateway_uri};
 pub use inspect::CertInfo;

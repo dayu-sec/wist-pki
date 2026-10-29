@@ -80,7 +80,10 @@ impl CertificateAuthority {
             )
         })?;
         let key = std::fs::read_to_string(ca_key_path).map_err(|err| {
-            format!("failed to read CA private key {}: {err}", ca_key_path.display())
+            format!(
+                "failed to read CA private key {}: {err}",
+                ca_key_path.display()
+            )
         })?;
         Self::from_pem(&cert, &key)
     }
@@ -180,7 +183,9 @@ impl CertificateAuthority {
         ttl_seconds: i64,
     ) -> Result<IssuedCertificate, String> {
         if ttl_seconds <= 0 {
-            return Err(format!("certificate ttl must be positive, got {ttl_seconds}"));
+            return Err(format!(
+                "certificate ttl must be positive, got {ttl_seconds}"
+            ));
         }
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|err| format!("failed to parse certificate signing request: {err}"))?;
@@ -302,7 +307,8 @@ mod tests {
             .issue_client_certificate(&csr("ignored-cn"), "ingest-a", 3600)
             .expect("issue");
 
-        let identity = PeerIdentity::from_certificate_der(&issued.certificate_der).expect("identity");
+        let identity =
+            PeerIdentity::from_certificate_der(&issued.certificate_der).expect("identity");
         assert_eq!(identity.id, "ingest-a");
         assert_eq!(identity.fingerprint_sha256, issued.fingerprint_sha256_hex);
     }
